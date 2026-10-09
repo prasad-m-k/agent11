@@ -142,7 +142,7 @@ func startIntake(ctx context.Context, addr, token string, logger *slog.Logger, s
 func authorized(r *http.Request, token string) bool {
 	got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 	if got == "" {
-		got = r.Header.Get("X-Firetail-Token")
+		got = r.Header.Get("X-Agent11-Token")
 	}
 	return subtle.ConstantTimeCompare([]byte(got), []byte(token)) == 1
 }

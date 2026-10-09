@@ -1,4 +1,4 @@
-// Command go-firetail watches the system clipboard and running AI/LLM apps,
+// Command agent11 watches the system clipboard and running AI/LLM apps,
 // and appends each change to a rotating log file.
 package main
 
@@ -63,7 +63,7 @@ func readClipboard(ctx context.Context) ([]byte, error) {
 func main() {
 	interval := flag.Duration("interval", 500*time.Millisecond, "how often to poll the clipboard")
 	once := flag.Bool("once", false, "print the current clipboard to stdout and exit")
-	logPath := flag.String("log", "firetail.log", "log file path")
+	logPath := flag.String("log", "agent11.log", "log file path")
 	maxMB := flag.Float64("max-mb", 10, "rotate after the log reaches this many MB (0 = no size limit)")
 	maxLines := flag.Int64("max-lines", 10000, "rotate after the log reaches this many lines (0 = no line limit)")
 	maxBackups := flag.Int("max-backups", 5, "number of rotated files to keep")
@@ -116,7 +116,7 @@ func main() {
 		logger.Error("clipboard unavailable", "err", err)
 		os.Exit(1)
 	}
-	logger.Info("firetail started", "interval", *interval, "log", *logPath,
+	logger.Info("agent11 started", "interval", *interval, "log", *logPath,
 		"max_mb", *maxMB, "max_lines", *maxLines, "max_backups", *maxBackups, "ai_interval", *aiInterval)
 
 	intakeErrCh := make(chan error, 1)
@@ -126,7 +126,7 @@ func main() {
 			token = newToken()
 			// Printed to stderr, never the log file, so the token is not
 			// persisted alongside the data it protects.
-			fmt.Fprintf(os.Stderr, "firetail: intake token: %s\n", token)
+			fmt.Fprintf(os.Stderr, "agent11: intake token: %s\n", token)
 		}
 		go func() {
 			if err := startIntake(ctx, *listen, token, logger, scanner, *logContent); err != nil {
@@ -168,7 +168,7 @@ func main() {
 	for {
 		select {
 		case <-ctx.Done():
-			logger.Info("firetail stopped")
+			logger.Info("agent11 stopped")
 			select {
 			case <-intakeErrCh:
 				os.Exit(1) // the intake endpoint failed to start
