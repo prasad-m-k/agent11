@@ -1,0 +1,9 @@
+Draft a polite reply declining a meeting invitation for Thursday.
+---
+What is the time complexity of quicksort in the worst case?
+---
+Translate "good morning" into Spanish and French.
+---
+Suggest names for a team offsite at the lake.
+---
+Order 12345 shipped on 2026-09-30 and the tracking page shows 1Z999.

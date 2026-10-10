@@ -1,0 +1,14 @@
+Can you refactor this handler? It lives in services/core-platform/billing/handler.go
+func (h *Handler) Settle(ctx context.Context, id string) error {
+	return h.ledger.Close(ctx, id)
+}
+---
+The ProjectX rollout plan depends on the new scheduler. Here is the interface:
+type Scheduler interface { Next() Job }
+---
+Error from /home/dev/src/core-platform/internal/auth/session.go:88: nil pointer dereference
+---
+Summarize the design notes for ProjectX phase two and list open risks.
+---
+diff --git a/core-platform/api/routes.go b/core-platform/api/routes.go
++	r.Post("/v2/settlements", h.Settle)

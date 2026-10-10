@@ -1,0 +1,5 @@
+Customer CUST-00412345 called about a refund, card 4111 1111 1111 1111.
+---
+Clean up this CUSTOMER-EXPORT file before I send it to the vendor.
+---
+Applicant SSN 123-45-6789, please format as a table.
