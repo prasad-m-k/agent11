@@ -1,0 +1,74 @@
+{
+  "version": 1,
+  "mode": "report",
+  "destinations": {
+    "approved-tenant": ["api.company-llm.example"],
+    "consumer-chat": ["chatgpt.com", "claude.ai", "gemini.google.com"],
+    "public-api": ["api.openai.com", "api.anthropic.com", "openrouter.ai"]
+  },
+  "classes": [
+    {
+      "id": "source-code",
+      "description": "Proprietary application source code",
+      "owner": "engineering",
+      "detectors": {
+        "source_labels": ["repo:core-platform"],
+        "path_globs": ["**/core-platform/**"],
+        "keywords": ["ProjectX"],
+        "rules": []
+      },
+      "classifier": {
+        "enabled": true,
+        "block_at": 0.90,
+        "hold_at": 0.50,
+        "classifier_raw": false,
+        "examples_positive": ["internal service handler with company package names"],
+        "examples_negative": ["open-source library usage question"]
+      },
+      "actions": {
+        "approved-tenant": "allow",
+        "consumer-chat": "block",
+        "public-api": "block"
+      },
+      "mode": "report"
+    },
+    {
+      "id": "credentials",
+      "description": "Secrets that grant access: API keys, tokens, private keys",
+      "owner": "security",
+      "detectors": {
+        "rules": ["private-key", "aws-access-key", "gcp-api-key", "openai-key", "anthropic-key", "github-token", "slack-token", "jwt"]
+      },
+      "classifier": {
+        "enabled": false
+      },
+      "actions": {
+        "approved-tenant": "block",
+        "consumer-chat": "block",
+        "public-api": "block"
+      },
+      "mode": "report"
+    },
+    {
+      "id": "customer-data",
+      "description": "Personal data about customers: identifiers, card numbers, contact details",
+      "owner": "privacy",
+      "detectors": {
+        "keywords": ["CUSTOMER-EXPORT"],
+        "rules": ["us-ssn", "credit-card", "re:\\bCUST-\\d{8}\\b"]
+      },
+      "classifier": {
+        "enabled": true,
+        "block_at": 0.95,
+        "hold_at": 0.60,
+        "classifier_raw": false
+      },
+      "actions": {
+        "approved-tenant": "allow",
+        "consumer-chat": "block",
+        "public-api": "hold"
+      },
+      "mode": "report"
+    }
+  ]
+}
