@@ -11,7 +11,7 @@ agent11 has two jobs:
 
 Job 1 exists today. Job 2's phase 1 pieces (policy, decision pipeline, report/enforce proxy, classifier interface, file sink, eval) are built. Read "Status" before changing anything.
 
-The project is standard library only, with no third-party dependencies. Keep it that way unless asked.
+The project uses the standard library plus one approved dependency, `modernc.org/sqlite` (pure Go, no cgo) for the metrics store. Ask before adding any other.
 
 ## Status
 
@@ -19,8 +19,13 @@ The project is standard library only, with no third-party dependencies. Keep it 
 | --- | --- |
 | Clipboard, process, and Chrome tab watching | Built |
 | DLP scan (secrets, PII, user keywords) | Built |
+| Clipboard guard (replace a sensitive clipboard with a notice) | Built, off by default (`-clipboard-guard`) |
 | Loopback `/scan` and `/healthz` endpoint | Built, returns findings only |
 | Rotating log | Built |
+| Metrics store (local SQLite) and `agent11 metrics query/export/clear` | Built (phase 1); dashboard planned (phase 2) |
+| Agent lifecycle metrics from Claude Code and Antigravity hooks (time in state, blocked time, turns, operator waits, errors, stalls), launch stats, CPU and memory per AI app | Built (phase 1.1) |
+| Declarative hook adapters: add a new agent via a JSON file, no recompile | Built (phase 1.1) |
+| Local web dashboard over the metrics database (`agent11 dashboard`) | Built (phase 2) |
 | Policy file, classes, destination matrix | Built (`policy.go`, `policy.example.json`), reloaded on change |
 | Decision pipeline | Built (`decide.go`) |
 | LLM reverse proxy that can block | Built (`proxy.go`), report mode by default |
@@ -30,7 +35,7 @@ The project is standard library only, with no third-party dependencies. Keep it 
 | Surrogate translation (DPTP) | Interface stub only |
 | c11 integration (agent identity, sidebar) | Out of scope until phase 3 |
 
-agent11 can block only requests that agents send through the proxy, and only for classes in enforce mode. It reads request bodies in memory to decide, and never stores or logs them. It does not inspect responses. Browser watching sees only the host of a tab. Do not describe planned features as working in code comments, logs, or docs.
+agent11 can block only requests that agents send through the proxy, and only for classes in enforce mode. For browser chats it can at most wipe a sensitive clipboard (`-clipboard-guard`); it cannot see or stop typed text or a paste made within one polling interval of the copy. It reads request bodies in memory to decide, and never stores or logs them. It reads the response only to pull out the token-usage counts (integers), never the response content. Browser watching sees only the host of a tab. Do not describe planned features as working in code comments, logs, or docs.
 
 ## Build and run
 
@@ -57,7 +62,25 @@ Enforcement flags (all listed in the `agent11 started` log line):
 -classifier none             # none or jev (reads OPENROUTER_API_KEY)
 -classifier-model typesafe/jev-1.13
 -classifier-timeout 2s
+-clipboard-guard off          # off, ai (AI site or desktop AI app open), or always
+-guard-rules <list>           # DLP rules that trigger the guard; default: all but email, plus keyword:*
+-metrics=true                 # body-free metrics in SQLite; -metrics-db, -metrics-retention 336h, -metrics-max-mb 256
 ```
+
+Read the metrics store with or without agent11 running:
+
+```
+./agent11 metrics query --from 24h [--json] [--class id --dest host --category name --agent id]
+                         [--agent-kind claude-code --model id --stall-ms 900000]
+./agent11 metrics export --from 7d --output events.ndjson
+./agent11 metrics clear --yes
+./agent11 hook --list-agents                              # built-in + custom agents (adapters dir)
+./agent11 hook --print-config [<agent>]                   # config fragment wiring that agent's lifecycle hooks to agent11
+./agent11 dashboard [--db path] [--listen 127.0.0.1:9090]  # read-only web view of the metrics database
+#   (the collector also serves it on 127.0.0.1:9090 by default; -dashboard "" turns it off)
+```
+
+`-hooks` (default true, needs `-metrics`) serves `agent11 hook` on `-hook-socket`, default `<user config dir>/agent11/hooks.sock`.
 
 Point agents at the proxy with the upstream host as the first path segment:
 
@@ -77,7 +100,13 @@ Everything is `package main` in the repo root unless a file says otherwise.
 | `main.go` | Flags, clipboard polling loop, `logClipboard`, wiring of the other components |
 | `procwatch.go` | AI app detection from the process list (`aiApps`), grouping helpers, command-line redaction |
 | `browserwatch.go` | AI site detection in Chrome tabs via `osascript` (`aiSites`), macOS only |
-| `dlp.go` | DLP rules (`builtinRules`), Luhn check, user keyword rules, `scan` and `summary` |
+| `dlp.go` | DLP rules (`builtinRules`), card search (`cardsIn`) and Luhn check, user keyword rules, `scan` and `summary` |
+| `metrics.go` | Metrics store: schema, private file creation, batched writer, retention, `recorder` interface |
+| `metrics_query.go` | `agent11 metrics` CLI: query report, NDJSON export, clear |
+| `lifecycle.go` | `agent11 hook` client and Claude Code mapping, hook socket server, provider and model extraction |
+| `lifecycle_query.go` | Lifecycle fold (time in state, blocked, turns, waits, errors, stalls), launch stats, resource usage |
+| `adapters.go` | Declarative hook-adapter engine: add a new agent via `<name>.json` in the adapters dir (`~/.config/agent11/adapters/`, see `docs/adapters/example.json`) |
+| `guard.go` | Clipboard guard: trigger rules, notice text, clipboard writers, AI-context checks |
 | `intake.go` | Optional `/scan` and `/healthz` HTTP endpoint with bearer-token auth |
 | `rotate.go` | `rotatingFile`, a size and line-count rotating `io.Writer` |
 | `policy.go` | Load and validate the JSON policy; `Verdict`; class definitions; destination matrix; path globs |
@@ -90,6 +119,8 @@ Everything is `package main` in the repo root unless a file says otherwise.
 | `policy.example.json` | Example policy; the real classes are an owner decision |
 | `testdata/corpus/` | Synthetic labeled samples, `<class>.positive.txt` / `<class>.negative.txt`, `---` between samples |
 | `docs/ARCHITECTURE.md` | Architecture and design decisions: components, endpoints, storage, access, failure behavior |
+| `docs/CAPABILITIES.md` | Plain-language capabilities overview for product and sales use |
+| `docs/ROADMAP.md` | Phased plan: OS-level (`lsof`/`/proc`), network, browser, and enforcement |
 
 Planned: an HTTP sink for SwarmSentinel in `events.go` (phase 2).
 
@@ -110,12 +141,16 @@ Existing:
 - Process command lines go through `sanitizeCmd` (redacts key/token/secret args, truncates to 300 chars) before logging.
 - Log files are created with mode `0600`.
 - Repeated errors are logged once per distinct message (`lastErr` pattern), not on every tick.
+- The metrics store is body-free: rows hold kinds, labels, counts, timings, and token-usage integers, never clipboard text, request content, prompts, responses, or command lines. Intake source and site labels are capped at 64 bytes. The database is created 0600 in a 0700 directory; symlinks are refused.
+- `agent11 hook [--agent <kind>]` maps each agent's own hook payload to a lifecycle event and keeps only the event name, opaque IDs (c11's rule: printable ASCII, no spaces or slashes, at most 128 bytes) and a model name. Claude Code is the default; `--agent antigravity` reads Antigravity's `conversationId`/`toolCall`/`modelName` payload. It never forwards prompts, tool input or output, transcript or workspace paths, or notification text. It never forwards prompts, tool input or output, or notification text, prints nothing to stdout, and always exits 0. The hook socket is 0600 in a 0700 directory, and the server re-validates every field.
+- `Record` never blocks a caller: a full buffer drops the event and counts it in `meta.dropped_events`.
+- The clipboard guard is off by default. Its notice names rules and counts only, and guarded text is never logged, whatever `-log-content` says.
 
 New, for the enforcement work:
 
 - A `Decision` carries class IDs, rule names, confidence, verdict, mode, agent ID, and destination host. It never carries request content, matched text, or prompts. The same holds for every event sent to a sink.
 - The proxy binds to loopback only, reusing `isLoopback`. It does no TLS interception. Agents reach it through a base-URL override (for example `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` pointing at `http://127.0.0.1:<port>`).
-- Request bodies are capped. Streaming responses pass through unmodified. The proxy never stores a request or response body, in memory beyond the request or on disk.
+- Request bodies are capped. Streaming responses pass through as they arrive; the proxy scans them in flight only to read the `usage` token counts, keeping the integers and never buffering or storing the body. The proxy never stores a request or response body, in memory beyond the request or on disk.
 - API keys and authorization headers pass through to the upstream and are never logged.
 - A hosted classifier never receives raw request content by default. It receives features (path labels, document markers, length, rule counts) or text that has already been through the `Translator`. A class may opt in to raw content only with `"classifier_raw": true` in the policy, and that choice must be visible in the startup log.
 - Hard rules are deterministic. Source labels, fingerprints, patterns, and path denies never wait on a classifier and never depend on a probability.
@@ -235,7 +270,7 @@ agent11 must work for any agent, so each integration path has a defined role and
 | --- | --- | --- | --- |
 | CLI and SDK agents (Claude Code, scripts, others) | Base-URL override to the proxy | Yes | Only tools that honor a base-URL setting |
 | Claude Code hooks | `UserPromptSubmit` and `PreToolUse` hooks call `/scan` | Yes | Claude Code only; hooks must also cover file reads |
-| Clipboard | Polling watcher; may overwrite the clipboard on a match while an AI app is in front | Partly | Race between polls; typed text not covered |
+| Clipboard | Polling watcher; `-clipboard-guard` overwrites the clipboard on a match (`ai`: while an AI site in Chrome or a desktop AI app is open) | Partly | Race between polls; typed text not covered; AI context only from Chrome on macOS and the process list |
 | Browser chats | Extension posts to `/scan` and blocks submit | Yes, with extension | Needs a managed extension; not built yet |
 | Desktop AI apps | Process watching for inventory | No | Needs network egress rules to block |
 | Other machines and employees | Out of scope for the local binary | No | Needs endpoint rollout and an egress gateway |
@@ -284,7 +319,7 @@ Exit criteria. These are proposals, so confirm them with the owner before treati
 
 ## Non-goals
 
-- Reading or storing prompts, responses, or documents.
+- Reading or storing prompts, response content, or documents. (Token-usage counts read from a response are integers, not content.)
 - TLS interception or system-wide traffic capture.
 - Replacing a network egress gateway or an MDM-managed endpoint agent.
 - Judging whether data is legally privileged. Companies define classes. Counsel defines what they mean.

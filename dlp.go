@@ -7,12 +7,26 @@ import (
 	"strings"
 )
 
-// dlpRule flags a class of sensitive data by pattern. validate, when set, does
-// a second check on each match (e.g. Luhn) to cut false positives.
+// dlpRule flags a class of sensitive data by pattern. count, when set, does a
+// second pass over each match and returns how many real hits it holds (e.g.
+// card numbers that pass Luhn), to cut false positives; zero rejects it.
 type dlpRule struct {
-	name     string
-	re       *regexp.Regexp
-	validate func(string) bool
+	name  string
+	re    *regexp.Regexp
+	count func(string) int
+}
+
+// hits returns how many times the rule fires in text.
+func (r dlpRule) hits(text string) int {
+	n := 0
+	for _, m := range r.re.FindAllString(text, -1) {
+		if r.count == nil {
+			n++
+		} else {
+			n += r.count(m)
+		}
+	}
+	return n
 }
 
 // builtinRules detect common secrets and PII. They match structure, not the
@@ -28,7 +42,39 @@ var builtinRules = []dlpRule{
 	{name: "jwt", re: regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b`)},
 	{name: "email", re: regexp.MustCompile(`\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b`)},
 	{name: "us-ssn", re: regexp.MustCompile(`\b\d{3}-\d{2}-\d{4}\b`)},
-	{name: "credit-card", re: regexp.MustCompile(`\b(?:\d[ -]?){13,19}\b`), validate: luhnValid},
+	// A run of digit groups split by single spaces, dashes, or dots. The run is
+	// matched whole and searched for cards in cardsIn, because a greedy 13-19
+	// digit match would swallow a trailing expiry or CVV and fail Luhn.
+	{name: "credit-card", re: regexp.MustCompile(`\b\d+(?:[ .-]\d+)*\b`), count: cardsIn},
+}
+
+// cardsIn counts card numbers in a run of digit groups. A card is a window of
+// whole consecutive groups holding 13 to 19 digits that starts with a card
+// network digit (2 to 6) and passes Luhn. Windows start at every group, so a
+// number stays visible when an order ID precedes it or an expiry and CVV
+// follow it on the same line; a found card's groups are not reused.
+func cardsIn(run string) int {
+	groups := strings.FieldsFunc(run, func(r rune) bool { return r == ' ' || r == '-' || r == '.' })
+	n := 0
+	for i := 0; i < len(groups); {
+		found := 0
+		digits := 0
+		for j := i; j < len(groups) && digits < 19; j++ {
+			digits += len(groups[j])
+			if digits >= 13 && digits <= 19 && groups[i][0] >= '2' && groups[i][0] <= '6' &&
+				luhnValid(strings.Join(groups[i:j+1], "")) {
+				found = j - i + 1
+				break
+			}
+		}
+		if found > 0 {
+			n++
+			i += found
+		} else {
+			i++
+		}
+	}
+	return n
 }
 
 // luhnValid reports whether the digits in s pass the Luhn checksum, which
@@ -88,14 +134,7 @@ func newDLPScanner(keywords []string) *dlpScanner {
 func (s *dlpScanner) scan(text string) []finding {
 	var out []finding
 	for _, r := range s.rules {
-		matches := r.re.FindAllString(text, -1)
-		n := 0
-		for _, m := range matches {
-			if r.validate == nil || r.validate(m) {
-				n++
-			}
-		}
-		if n > 0 {
+		if n := r.hits(text); n > 0 {
 			out = append(out, finding{rule: r.name, count: n})
 		}
 	}

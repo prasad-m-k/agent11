@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"runtime"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -61,6 +62,60 @@ func readClipboard(ctx context.Context) ([]byte, error) {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "metrics" {
+		os.Exit(runMetricsCLI(os.Args[2:], os.Stdout, os.Stderr, time.Now()))
+	}
+	if len(os.Args) > 1 && os.Args[1] == "dashboard" {
+		os.Exit(runDashboardCLI(os.Args[2:], os.Stderr))
+	}
+	if len(os.Args) > 1 && os.Args[1] == "hook" {
+		rest := os.Args[2:]
+		// Custom agents are defined as JSON in the adapters directory.
+		adaptersDir := defaultAdaptersDir()
+		for i := 0; i < len(rest)-1; i++ {
+			if rest[i] == "--adapters" {
+				adaptersDir = rest[i+1]
+			}
+		}
+		if slices.Contains(rest, "--list-agents") {
+			for _, err := range loadCustomAdapters(adaptersDir) {
+				fmt.Fprintln(os.Stderr, "adapter warning:", err)
+			}
+			fmt.Println("agents agent11 can hook (built-in + adapters in " + adaptersDir + "):")
+			for _, name := range knownAgents() {
+				style := "built-in"
+				if a := customAdapters[name]; a != nil {
+					style = "custom (" + a.ConfigStyle + ")"
+				}
+				fmt.Printf("  %-16s %s\n", name, style)
+			}
+			return
+		}
+		if pc := slices.Index(rest, "--print-config"); pc >= 0 {
+			exe, err := os.Executable()
+			if err != nil {
+				exe = "agent11"
+			}
+			agent := hookAgentKindClaude
+			if pc+1 < len(rest) && !strings.HasPrefix(rest[pc+1], "-") {
+				agent = rest[pc+1]
+			}
+			if agent != hookAgentKindClaude && agent != hookAgentKindAntigrav {
+				for _, e := range loadCustomAdapters(adaptersDir) {
+					fmt.Fprintln(os.Stderr, "adapter warning:", e)
+				}
+			}
+			out, err := hooksSnippet(agent, exe)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "error:", err)
+				os.Exit(2)
+			}
+			fmt.Fprintln(os.Stderr, hookConfigDest(agent))
+			fmt.Println(out)
+			return
+		}
+		os.Exit(runHookCLI(rest, os.Stdin, time.Now()))
+	}
 	interval := flag.Duration("interval", 500*time.Millisecond, "how often to poll the clipboard")
 	once := flag.Bool("once", false, "print the current clipboard to stdout and exit")
 	logPath := flag.String("log", "agent11.log", "log file path")
@@ -82,6 +137,15 @@ func main() {
 	classifierName := flag.String("classifier", "none", "classifier for ambiguous text: none or jev (jev reads OPENROUTER_API_KEY)")
 	classifierModel := flag.String("classifier-model", jevDefaultModel, "pinned classifier model ID")
 	classifierTimeout := flag.Duration("classifier-timeout", 2*time.Second, "longest the classifier may hold up a request")
+	guardMode := flag.String("clipboard-guard", guardOff, "replace a sensitive clipboard with a notice: off, ai (while an AI site or desktop AI app is open), or always")
+	guardRules := flag.String("guard-rules", defaultGuardRules, "DLP rules that trigger the clipboard guard; keyword:* means every -dlp-keywords marker")
+	metricsOn := flag.Bool("metrics", true, "record body-free metrics in a local SQLite database (read with: agent11 metrics query)")
+	metricsPath := flag.String("metrics-db", defaultMetricsPath(), "metrics database path")
+	metricsRetention := flag.Duration("metrics-retention", 14*24*time.Hour, "how long metrics are kept")
+	metricsMaxMB := flag.Int64("metrics-max-mb", 256, "size cap for the metrics database, in MB")
+	hooksOn := flag.Bool("hooks", true, "accept agent lifecycle events from \"agent11 hook\" on a private Unix socket (needs -metrics)")
+	hookSocket := flag.String("hook-socket", defaultHookSocket(), "Unix socket for agent lifecycle hooks")
+	dashboardAddr := flag.String("dashboard", "127.0.0.1:9090", "serve the metrics dashboard on this loopback address (empty = off; needs -metrics)")
 	flag.Parse()
 
 	scanner := newDLPScanner(strings.Split(*keywords, ","))
@@ -91,6 +155,15 @@ func main() {
 
 	if *mode != "" && *mode != modeReport && *mode != modeEnforce {
 		fmt.Fprintf(os.Stderr, "error: -mode %q is not report or enforce\n", *mode)
+		os.Exit(2)
+	}
+	guard, err := newClipboardGuard(*guardMode, *guardRules)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(2)
+	}
+	if guard.mode == guardAI && *aiInterval <= 0 {
+		fmt.Fprintln(os.Stderr, "error: -clipboard-guard ai needs -ai-interval > 0 to know when AI tools are open")
 		os.Exit(2)
 	}
 	if (*proxyAddr != "" || *evalDir != "") && *policyPath == "" {
@@ -161,8 +234,22 @@ func main() {
 		logger.Error("clipboard unavailable", "err", err)
 		os.Exit(1)
 	}
+	var rec recorder = nopRecorder{}
+	var store *metricsStore
+	if *metricsOn {
+		store, err = openMetricsStore(*metricsPath, *metricsRetention, *metricsMaxMB*1024*1024, logger)
+		if err != nil {
+			logger.Error("metrics unavailable", "err", err)
+			os.Exit(1)
+		}
+		rec = store
+		defer store.Close()
+	}
+	rec.Record(metricEvent{Kind: kindAgentStarted})
+
 	startAttrs := []any{"interval", *interval, "log", *logPath,
-		"max_mb", *maxMB, "max_lines", *maxLines, "max_backups", *maxBackups, "ai_interval", *aiInterval}
+		"max_mb", *maxMB, "max_lines", *maxLines, "max_backups", *maxBackups, "ai_interval", *aiInterval,
+		"clipboard_guard", guard.mode}
 	if dec != nil {
 		pol := dec.policy.Load()
 		startAttrs = append(startAttrs, "policy", *policyPath, "proxy", *proxyAddr, "proxy_max_mb", *proxyMaxMB,
@@ -170,6 +257,15 @@ func main() {
 		// Raw content to a hosted classifier is an explicit policy choice; make it visible.
 		if raw := pol.rawClassifierClasses(); len(raw) > 0 && *classifierName != "none" {
 			startAttrs = append(startAttrs, "classifier_raw", strings.Join(raw, ","))
+		}
+	}
+	if store != nil {
+		startAttrs = append(startAttrs, "metrics_db", *metricsPath, "metrics_retention", *metricsRetention)
+		if *hooksOn {
+			startAttrs = append(startAttrs, "hook_socket", *hookSocket)
+		}
+		if *dashboardAddr != "" {
+			startAttrs = append(startAttrs, "dashboard", *dashboardAddr)
 		}
 	}
 	logger.Info("agent11 started", startAttrs...)
@@ -184,15 +280,33 @@ func main() {
 			fmt.Fprintf(os.Stderr, "agent11: intake token: %s\n", token)
 		}
 		go func() {
-			if err := startIntake(ctx, *listen, token, logger, scanner, *logContent); err != nil {
+			if err := startIntake(ctx, *listen, token, logger, scanner, *logContent, rec); err != nil {
 				logger.Error("intake endpoint failed", "err", err)
 				intakeErrCh <- err
 				stop() // a requested endpoint that cannot start ends the program
 			}
 		}()
 	}
+	if store != nil && *hooksOn {
+		go func() {
+			if err := startHookServer(ctx, *hookSocket, rec, logger); err != nil {
+				// Lifecycle metrics are optional; the rest of agent11 keeps running.
+				logger.Error("hook socket failed", "err", err)
+			}
+		}()
+	}
+	if store != nil && *dashboardAddr != "" {
+		// Reads the same database read-only; WAL mode allows it alongside the
+		// writer. A bind failure is logged but does not stop collection.
+		go func() {
+			if err := startDashboard(ctx, *dashboardAddr, *metricsPath, defaultStallMs, logger); err != nil {
+				logger.Error("dashboard failed", "err", err)
+			}
+		}()
+	}
 	if *proxyAddr != "" {
 		p := newLLMProxy(dec, logSink{logger}, logger, int64(*proxyMaxMB*1024*1024))
+		p.rec = rec
 		go func() {
 			if err := startProxy(ctx, *proxyAddr, p); err != nil {
 				logger.Error("proxy failed", "err", err)
@@ -212,9 +326,6 @@ func main() {
 		defer t.Stop()
 		policyTick = t.C
 	}
-	if len(last) > 0 {
-		logClipboard(logger, scanner, *logContent, last)
-	}
 
 	var aiTick <-chan time.Time
 	var ai *aiWatcher
@@ -222,12 +333,14 @@ func main() {
 	var lastAIErr, lastBrowserErr string
 	if *aiInterval > 0 {
 		ai = newAIWatcher(logger)
+		ai.rec = rec
 		if err := ai.scan(ctx, true); err != nil {
 			logger.Error("process scan failed", "err", err)
 			lastAIErr = err.Error()
 		}
 		if *watchBrowser {
 			browser = newBrowserWatcher(logger)
+			browser.rec = rec
 			if err := browser.scan(ctx, true); err != nil {
 				logger.Error("browser scan failed", "err", err)
 				lastBrowserErr = err.Error()
@@ -238,6 +351,36 @@ func main() {
 		aiTick = t.C
 	}
 
+	aiContext := func() bool {
+		return (browser != nil && browser.anyOpen()) || (ai != nil && ai.anyDesktop())
+	}
+	// handleClipboard logs a new clipboard value, or guards it, and returns
+	// what the clipboard now holds.
+	handleClipboard := func(data []byte) []byte {
+		findings := scanner.scan(string(data))
+		hit := guard.trigger(findings, aiContext())
+		if len(hit) == 0 {
+			logClipboard(logger, scanner, *logContent, data)
+			rec.Record(metricEvent{Kind: kindClipboard, Bytes: len(data), Rules: findings})
+			return data
+		}
+		notice := []byte(guardNotice(hit))
+		if err := writeClipboard(ctx, notice); err != nil {
+			logger.Error("clipboard guard failed", "err", err, "dlp", summary(hit))
+			logClipboard(logger, scanner, *logContent, data)
+			rec.Record(metricEvent{Kind: kindClipboard, Bytes: len(data), Rules: findings})
+			return data
+		}
+		// The guarded text is never logged, whatever -log-content says: the
+		// guard exists to keep it from going anywhere.
+		logger.Warn("clipboard guarded", "bytes", len(data), "dlp", summary(hit), "mode", guard.mode)
+		rec.Record(metricEvent{Kind: kindClipboardGuard, Bytes: len(data), Rules: hit, Mode: guard.mode})
+		return notice
+	}
+	if len(last) > 0 {
+		last = handleClipboard(last)
+	}
+
 	ticker := time.NewTicker(*interval)
 	defer ticker.Stop()
 	var lastErr string
@@ -245,8 +388,12 @@ func main() {
 		select {
 		case <-ctx.Done():
 			logger.Info("agent11 stopped")
+			rec.Record(metricEvent{Kind: kindAgentStopped})
 			select {
 			case <-intakeErrCh:
+				if store != nil {
+					store.Close() // os.Exit skips deferred calls
+				}
 				os.Exit(1) // the intake endpoint or proxy failed to start
 			default:
 			}
@@ -271,6 +418,7 @@ func main() {
 			policyMod, lastPolicyErr = fi.ModTime(), ""
 			dec.policy.Store(pol)
 			logger.Info("policy reloaded", "policy", *policyPath, "classes", len(pol.Classes))
+			rec.Record(metricEvent{Kind: kindPolicyReload})
 			continue
 		case <-aiTick:
 			if err := ai.scan(ctx, false); err != nil {
@@ -309,8 +457,7 @@ func main() {
 		}
 		lastErr = ""
 		if len(data) > 0 && !bytes.Equal(data, last) {
-			logClipboard(logger, scanner, *logContent, data)
-			last = data
+			last = handleClipboard(data)
 		}
 	}
 }

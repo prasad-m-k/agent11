@@ -236,11 +236,8 @@ func hardHits(c *Class, req decideRequest, paths []string, prints map[string]boo
 		rules = append(rules, "keyword")
 	}
 	for _, r := range c.rules {
-		for _, m := range r.re.FindAllString(req.Text, -1) {
-			if r.validate == nil || r.validate(m) {
-				rules = append(rules, "rule:"+r.name)
-				break
-			}
+		if r.hits(req.Text) > 0 {
+			rules = append(rules, "rule:"+r.name)
 		}
 	}
 	return rules

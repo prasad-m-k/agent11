@@ -96,11 +96,12 @@ end if`
 // browserWatcher logs when an AI site is opened in or closed from Chrome.
 type browserWatcher struct {
 	logger *slog.Logger
+	rec    recorder
 	open   map[string]bool
 }
 
 func newBrowserWatcher(logger *slog.Logger) *browserWatcher {
-	return &browserWatcher{logger: logger, open: map[string]bool{}}
+	return &browserWatcher{logger: logger, rec: nopRecorder{}, open: map[string]bool{}}
 }
 
 func (w *browserWatcher) scan(ctx context.Context, initial bool) error {
@@ -120,6 +121,7 @@ func (w *browserWatcher) scan(ctx context.Context, initial bool) error {
 			msg = "ai site open"
 		}
 		w.logger.Info(msg, "browser", "chrome", "site", h)
+		w.rec.Record(metricEvent{Kind: kindAISiteOpened, App: h, Mode: initialMode(initial)})
 	}
 
 	closed := make([]string, 0)
@@ -131,6 +133,7 @@ func (w *browserWatcher) scan(ctx context.Context, initial bool) error {
 	slices.Sort(closed)
 	for _, h := range closed {
 		w.logger.Info("ai site closed", "browser", "chrome", "site", h)
+		w.rec.Record(metricEvent{Kind: kindAISiteClosed, App: h})
 	}
 
 	w.open = now

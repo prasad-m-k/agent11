@@ -1,0 +1,26 @@
+{
+  "name": "mytool",
+  "config_style": "args",
+  "fields": {
+    "session": "sessionId",
+    "turn": "turnId",
+    "request": "callId",
+    "model": "model",
+    "tool": "toolName"
+  },
+  "tool_classes": {
+    "AskHuman": "ask_user_question",
+    "ReviewPlan": "exit_plan_mode"
+  },
+  "events": {
+    "start":    { "kind": "agent_session_started" },
+    "prompt":   { "kind": "agent_turn_started" },
+    "tool":     { "kind": "agent_tool_activity", "use_request": true,
+                  "by_tool_class": { "ask_user_question": "agent_question_requested",
+                                     "exit_plan_mode": "agent_plan_review_requested" } },
+    "tool_end": { "kind": "agent_attention_resolved", "use_request": true,
+                  "require_request_for_classes": ["ask_user_question", "exit_plan_mode"] },
+    "stop":     { "kind": "agent_turn_completed",
+                  "by_field": { "field": "error", "present": "agent_error" } }
+  }
+}

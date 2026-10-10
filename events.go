@@ -13,6 +13,7 @@ import (
 type Event struct {
 	Time time.Time
 	Decision
+	Model string // the request's model field, when it has one; a name, not content
 }
 
 // Sink receives decision events. The default writes logfmt to the rotating

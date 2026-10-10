@@ -14,7 +14,9 @@ import (
 	"net/http/httputil"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 )
@@ -41,6 +43,7 @@ type llmProxy struct {
 	logger    *slog.Logger
 	maxBody   int64
 	transport http.RoundTripper
+	rec       recorder
 
 	scheme        string // "https"; tests swap in their own TLS server
 	allowLoopback bool   // tests only: production refuses loopback upstreams
@@ -48,7 +51,7 @@ type llmProxy struct {
 
 func newLLMProxy(d *decider, sink Sink, logger *slog.Logger, maxBody int64) *llmProxy {
 	return &llmProxy{decider: d, sink: sink, logger: logger, maxBody: maxBody,
-		transport: http.DefaultTransport, scheme: "https"}
+		transport: http.DefaultTransport, scheme: "https", rec: nopRecorder{}}
 }
 
 // startProxy serves the proxy on a loopback address until ctx is cancelled.
@@ -113,10 +116,13 @@ func (p *llmProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		AgentID:     strings.TrimSpace(r.Header.Get(headerAgent)),
 		Destination: host,
 	}
+	start := time.Now()
 	d := p.decider.decide(r.Context(), req)
-	if err := p.sink.Emit(Event{Time: time.Now(), Decision: d}); err != nil {
+	ev := Event{Time: time.Now(), Decision: d, Model: requestModel(body)}
+	if err := p.sink.Emit(ev); err != nil {
 		p.logger.Error("event sink failed", "err", err)
 	}
+	p.rec.Record(decisionEvent(ev, ev.Time.Sub(start)))
 
 	if d.enforced() {
 		writeProxyError(w, http.StatusForbidden, "permission_error", blockMessage(d))
@@ -137,6 +143,14 @@ func (p *llmProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		},
 		Transport:     p.transport,
 		FlushInterval: -1, // flush each write so streamed responses pass through as they arrive
+		ModifyResponse: func(resp *http.Response) error {
+			// Read the usage field as the body streams past, storing only the
+			// token counts. The body is not buffered and content is not kept.
+			tc := &tokenCapture{rec: p.rec, model: ev.Model, provider: d.Destination,
+				dest: d.Destination, agentID: d.AgentID}
+			resp.Body = &teeReadCloser{rc: resp.Body, tee: io.TeeReader(resp.Body, tc), done: tc.record}
+			return nil
+		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			if r.Context().Err() == nil {
 				p.logger.Error("upstream failed", "dest", host, "err", err)
@@ -220,4 +234,81 @@ func splitList(s string) []string {
 		}
 	}
 	return out
+}
+
+// teeReadCloser feeds everything read from rc into a tee sink, and runs done
+// once when the body is fully read or closed. The ReverseProxy copies the body
+// to the client and then closes it, so done fires after the response is sent.
+type teeReadCloser struct {
+	rc   io.ReadCloser
+	tee  io.Reader
+	done func()
+	once sync.Once
+}
+
+func (t *teeReadCloser) Read(p []byte) (int, error) {
+	n, err := t.tee.Read(p)
+	if err == io.EOF {
+		t.once.Do(t.done)
+	}
+	return n, err
+}
+
+func (t *teeReadCloser) Close() error {
+	t.once.Do(t.done)
+	return t.rc.Close()
+}
+
+// usageTokens pulls the first input/prompt token count and the last
+// output/completion token count out of an LLM response, so it works for both
+// a single JSON body and an SSE stream (Anthropic reports output_tokens again
+// in the final message_delta; OpenAI in the final chunk).
+var (
+	reInTokens  = regexp.MustCompile(`"(?:input_tokens|prompt_tokens)"\s*:\s*(\d+)`)
+	reOutTokens = regexp.MustCompile(`"(?:output_tokens|completion_tokens)"\s*:\s*(\d+)`)
+)
+
+// tokenCapture scans a response body incrementally for the usage field. It
+// keeps a small tail so a count split across two chunks is still found, and
+// never holds the whole body.
+type tokenCapture struct {
+	rec                            recorder
+	model, provider, dest, agentID string
+	tail                           []byte
+	inTokens, outTokens            int64
+	haveIn, haveOut                bool
+}
+
+const tokenScanOverlap = 64
+
+func (t *tokenCapture) Write(p []byte) (int, error) {
+	buf := p
+	if len(t.tail) > 0 {
+		buf = append(append([]byte(nil), t.tail...), p...)
+	}
+	if !t.haveIn {
+		if m := reInTokens.FindSubmatch(buf); m != nil {
+			t.inTokens, _ = strconv.ParseInt(string(m[1]), 10, 64)
+			t.haveIn = true
+		}
+	}
+	// Output is taken from the last match seen across the whole stream.
+	if m := reOutTokens.FindAllSubmatch(buf, -1); m != nil {
+		t.outTokens, _ = strconv.ParseInt(string(m[len(m)-1][1]), 10, 64)
+		t.haveOut = true
+	}
+	if n := len(buf); n > tokenScanOverlap {
+		t.tail = append(t.tail[:0], buf[n-tokenScanOverlap:]...)
+	} else {
+		t.tail = append(t.tail[:0], buf...)
+	}
+	return len(p), nil
+}
+
+func (t *tokenCapture) record() {
+	if !t.haveIn && !t.haveOut {
+		return // not an LLM response with a usage field
+	}
+	t.rec.Record(metricEvent{Kind: kindTokenUsage, Model: t.model, Provider: providerFor(t.provider),
+		Dest: t.dest, AgentID: t.agentID, InTokens: t.inTokens, OutTokens: t.outTokens})
 }

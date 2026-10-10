@@ -60,7 +60,7 @@ func isLoopback(host string) bool {
 
 // startIntake runs the local scan server until ctx is cancelled. addr must be a
 // loopback address. Every request must carry the bearer token.
-func startIntake(ctx context.Context, addr, token string, logger *slog.Logger, scanner *dlpScanner, logContent bool) error {
+func startIntake(ctx context.Context, addr, token string, logger *slog.Logger, scanner *dlpScanner, logContent bool, rec recorder) error {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		return fmt.Errorf("listen address %q: %w", addr, err)
@@ -106,6 +106,10 @@ func startIntake(ctx context.Context, addr, token string, logger *slog.Logger, s
 		} else {
 			logger.Info("intake", attrs...)
 		}
+		// Source and site are caller-supplied labels; cap them so a caller
+		// cannot use them to store text.
+		rec.Record(metricEvent{Kind: kindIntake, App: capLabel(source), Dest: capLabel(req.Site),
+			Bytes: len(req.Text), Rules: findings})
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(intakeResponse{Flagged: len(findings) > 0, Findings: findings})
@@ -145,6 +149,15 @@ func authorized(r *http.Request, token string) bool {
 		got = r.Header.Get("X-Agent11-Token")
 	}
 	return subtle.ConstantTimeCompare([]byte(got), []byte(token)) == 1
+}
+
+// capLabel bounds a caller-supplied label before it is stored.
+func capLabel(s string) string {
+	const maxLabel = 64
+	if len(s) > maxLabel {
+		return s[:maxLabel]
+	}
+	return s
 }
 
 func firstNonEmpty(vals ...string) string {
