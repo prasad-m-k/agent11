@@ -130,3 +130,85 @@ func TestQueryTimelineBuckets(t *testing.T) {
 		t.Errorf("first 3 buckets = %d, want %d", first3, len(sampleEvents()))
 	}
 }
+
+func TestDashboardEventsAPI(t *testing.T) {
+	srv := httptest.NewServer(newDashboardServer(t, sampleEvents()).handler())
+	defer srv.Close()
+
+	get := func(qs string) eventsPage {
+		resp, err := http.Get(srv.URL + "/api/events" + qs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			t.Fatalf("status %d", resp.StatusCode)
+		}
+		var p eventsPage
+		if err := json.NewDecoder(resp.Body).Decode(&p); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	win := "?from=2026-10-09T12:00:00Z&to=2026-10-09T13:00:00Z"
+	all := get(win)
+	if all.Total != len(sampleEvents()) {
+		t.Errorf("total = %d, want %d", all.Total, len(sampleEvents()))
+	}
+	// Newest first.
+	for i := 1; i < len(all.Events); i++ {
+		if all.Events[i-1].Seq < all.Events[i].Seq {
+			t.Errorf("events not newest-first at %d", i)
+		}
+	}
+	// Every event has a timestamp and kind.
+	for _, e := range all.Events {
+		if e.TMs == 0 || e.Kind == "" {
+			t.Errorf("event missing time/kind: %+v", e)
+		}
+	}
+	// Kind filter.
+	dec := get(win + "&kind=decision")
+	if dec.Total != 4 {
+		t.Errorf("decision total = %d, want 4", dec.Total)
+	}
+	for _, e := range dec.Events {
+		if e.Kind != "decision" {
+			t.Errorf("kind filter leaked %s", e.Kind)
+		}
+	}
+	// Decision detail carries verdict and class, never content.
+	var blocked string
+	for _, e := range dec.Events {
+		if strings.Contains(e.Detail, "enforced") {
+			blocked = e.Detail
+		}
+	}
+	if blocked == "" || !strings.Contains(blocked, "block") {
+		t.Errorf("no enforced decision detail found: %v", dec.Events)
+	}
+	// Pagination.
+	pg := get(win + "&limit=3&offset=0")
+	if len(pg.Events) != 3 || pg.Limit != 3 {
+		t.Errorf("page = %d events limit %d", len(pg.Events), pg.Limit)
+	}
+	pg2 := get(win + "&limit=3&offset=3")
+	if len(pg2.Events) == 0 || pg2.Events[0].Seq >= pg.Events[2].Seq {
+		t.Errorf("offset page did not advance")
+	}
+}
+
+func TestEventDetailNoContent(t *testing.T) {
+	d := eventDetail(kindDecision, detailFields{verdict: "block", applied: "block", enforced: true,
+		dest: "api.anthropic.com", model: "claude-opus-5-5", labels: "class:source-code,rule:keyword"})
+	for _, want := range []string{"block", "enforced", "api.anthropic.com", "claude-opus-5-5", "keyword", "[source-code]"} {
+		if !strings.Contains(d, want) {
+			t.Errorf("detail %q missing %q", d, want)
+		}
+	}
+	tk := eventDetail(kindTokenUsage, detailFields{model: "gpt-5", dest: "api.openai.com", inTok: 100, outTok: 50})
+	if !strings.Contains(tk, "100 in / 50 out") {
+		t.Errorf("token detail = %q", tk)
+	}
+}

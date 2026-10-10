@@ -141,7 +141,7 @@ func main() {
 	guardRules := flag.String("guard-rules", defaultGuardRules, "DLP rules that trigger the clipboard guard; keyword:* means every -dlp-keywords marker")
 	metricsOn := flag.Bool("metrics", true, "record body-free metrics in a local SQLite database (read with: agent11 metrics query)")
 	metricsPath := flag.String("metrics-db", defaultMetricsPath(), "metrics database path")
-	metricsRetention := flag.Duration("metrics-retention", 14*24*time.Hour, "how long metrics are kept")
+	metricsRetention := flag.Duration("metrics-retention", 30*24*time.Hour, "how long metrics are kept before pruning (0 = keep until the size cap)")
 	metricsMaxMB := flag.Int64("metrics-max-mb", 256, "size cap for the metrics database, in MB")
 	hooksOn := flag.Bool("hooks", true, "accept agent lifecycle events from \"agent11 hook\" on a private Unix socket (needs -metrics)")
 	hookSocket := flag.String("hook-socket", defaultHookSocket(), "Unix socket for agent lifecycle hooks")

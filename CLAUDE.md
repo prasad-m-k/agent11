@@ -64,7 +64,7 @@ Enforcement flags (all listed in the `agent11 started` log line):
 -classifier-timeout 2s
 -clipboard-guard off          # off, ai (AI site or desktop AI app open), or always
 -guard-rules <list>           # DLP rules that trigger the guard; default: all but email, plus keyword:*
--metrics=true                 # body-free metrics in SQLite; -metrics-db, -metrics-retention 336h, -metrics-max-mb 256
+-metrics=true                 # body-free metrics in SQLite; -metrics-db, -metrics-retention 720h (30d), -metrics-max-mb 256
 ```
 
 Read the metrics store with or without agent11 running:

@@ -20,7 +20,7 @@ Employees now use AI coding agents (Claude Code, Antigravity, Cursor, Codex and 
 
 ## What it does with that
 
-- **A local metrics database.** Everything is recorded in a SQLite database on the machine, retained for a configurable window (14 days by default). It can be queried from the command line or exported.
+- **A local metrics database.** Everything is recorded in a SQLite database on the machine, retained for a configurable window (30 days by default) and hard-capped in size. It can be queried from the command line or exported.
 - **A dashboard.** `agent11 dashboard` serves a web page, on the local machine only, showing AI tool usage, agent activity, data-protection decisions, destinations and models, and agent11's own overhead, with an activity-over-time chart and adjustable time range.
 - **Data-loss decisions.** A company policy file defines data classes (source code, customer data, credentials, and so on) and where each may or may not go. agent11 classifies each LLM request against that policy and records a verdict: allow, flag, or block.
 

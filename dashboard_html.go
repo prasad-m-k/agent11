@@ -78,21 +78,21 @@ const dashboardHTML = `<!doctype html>
 <main>
   <div class="tiles" id="tiles"></div>
   <section class="card wide" style="margin-bottom:16px">
-    <h2>Activity over time</h2>
+    <h2>Activity over time <span id="zoomnote" class="muted" style="text-transform:none;letter-spacing:0;font-weight:400"></span></h2>
     <div id="chart"></div>
-    <div class="legend">
-      <span><i style="background:var(--accent)"></i>events</span>
-      <span><i style="background:var(--ok)"></i>agent turns</span>
-      <span><i style="background:var(--block)"></i>blocked</span>
-      <span><i style="background:var(--warn)"></i>sensitive</span>
-    </div>
+    <div class="legend" id="chartlegend"></div>
+    <div class="muted" style="font-size:11px;margin-top:4px">Drag across the chart to zoom to a time span. Click a legend to show or hide that series.</div>
   </section>
   <div class="grid" id="cards"></div>
+  <section class="card wide" id="eventscard" style="margin-top:16px"></section>
   <div class="foot" id="foot"></div>
 </main>
 <script>
 "use strict";
-var state = { from: "24h", auto: false, timer: null };
+var state = { from: "24h", absFrom: null, absTo: null, auto: false, timer: null,
+  series: { events: true, turns: true, blocked: true, sensitive: true },
+  lastTimeline: null, eventsKind: "", eventsOffset: 0 };
+var SERIES = [["events","--accent","events"],["turns","--ok","agent turns"],["blocked","--block","blocked"],["sensitive","--warn","sensitive"]];
 var RANGES = [["1h","1h"],["6h","6h"],["24h","24h"],["7d","7d"],["30d","30d"]];
 
 function el(tag, attrs, kids) {
@@ -172,31 +172,71 @@ function stateSegments(tis){
   return el("div",{},[seg, legend]);
 }
 
+function cssVar(n){ return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
+
 function drawChart(tl){
+  state.lastTimeline = tl;
+  renderChartLegend();
   var box = document.getElementById("chart"); box.innerHTML = "";
   var pts = tl.points || [];
   if (pts.length < 2) { box.appendChild(el("div",{class:"empty",text:"Not enough data to chart."})); return; }
   var W = box.clientWidth || 1000, H = 150, pad = 4;
   var svg = document.createElementNS("http://www.w3.org/2000/svg","svg");
   svg.setAttribute("viewBox","0 0 "+W+" "+H); svg.setAttribute("preserveAspectRatio","none");
-  var maxE = 1; pts.forEach(function(p){ maxE = Math.max(maxE, p.events); });
+  svg.style.cursor = "crosshair";
+  var active = SERIES.filter(function(s){ return state.series[s[0]]; }).map(function(s){ return s[0]; });
+  var maxE = 1; pts.forEach(function(p){ active.forEach(function(k){ maxE = Math.max(maxE, p[k]); }); });
   function x(i){ return pad + i*(W-2*pad)/(pts.length-1); }
   function y(v){ return H-pad - v*(H-2*pad)/maxE; }
-  // events area
-  var area = "M "+x(0)+" "+(H-pad);
-  pts.forEach(function(p,i){ area += " L "+x(i)+" "+y(p.events); });
-  area += " L "+x(pts.length-1)+" "+(H-pad)+" Z";
-  var cssVar = function(n){ return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); };
-  svg.appendChild(mkPath(area, "none", cssVar("--accent")+"22"));
-  svg.appendChild(mkLine(pts, x, y, function(p){return p.events;}, cssVar("--accent")));
-  svg.appendChild(mkLine(pts, x, y, function(p){return p.turns;}, cssVar("--ok")));
-  svg.appendChild(mkLine(pts, x, y, function(p){return p.blocked;}, cssVar("--block")));
-  svg.appendChild(mkLine(pts, x, y, function(p){return p.sensitive;}, cssVar("--warn")));
+  if (state.series.events){
+    var area = "M "+x(0)+" "+(H-pad);
+    pts.forEach(function(p,i){ area += " L "+x(i)+" "+y(p.events); });
+    area += " L "+x(pts.length-1)+" "+(H-pad)+" Z";
+    svg.appendChild(mkPath(area, "none", cssVar("--accent")+"22"));
+  }
+  SERIES.forEach(function(s){ if (state.series[s[0]]) svg.appendChild(mkLine(pts, x, y, function(p){return p[s[0]];}, cssVar(s[1]))); });
+  var sel = document.createElementNS("http://www.w3.org/2000/svg","rect");
+  sel.setAttribute("y","0"); sel.setAttribute("height",String(H)); sel.setAttribute("fill",cssVar("--accent")+"33"); sel.setAttribute("visibility","hidden");
+  svg.appendChild(sel);
   box.appendChild(svg);
   box.appendChild(el("div",{class:"legend"},[
     el("span",{class:"muted",text:fmtTime(tl.from_ms)}),
     el("span",{class:"muted",style:"margin-left:auto",text:fmtTime(tl.to_ms)})
   ]));
+  attachBrush(svg, sel, tl);
+}
+
+// renderChartLegend draws clickable series toggles.
+function renderChartLegend(){
+  var lg = document.getElementById("chartlegend"); lg.innerHTML = "";
+  SERIES.forEach(function(s){
+    var on = state.series[s[0]];
+    var item = el("span",{style:"cursor:pointer;user-select:none;opacity:"+(on?"1":"0.4"),
+      html:"<i style=\"background:"+cssVar(s[1])+"\"></i>"+s[2]});
+    item.onclick = function(){ state.series[s[0]] = !state.series[s[0]]; if (state.lastTimeline) drawChart(state.lastTimeline); };
+    lg.appendChild(item);
+  });
+}
+
+// attachBrush lets the user drag across the chart to zoom to a time span.
+function attachBrush(svg, sel, tl){
+  var startX = null, rect = null;
+  function fx(ev){ rect = svg.getBoundingClientRect(); return (ev.clientX - rect.left) / rect.width; }
+  function toMs(frac){ return Math.round(tl.from_ms + Math.max(0,Math.min(1,frac)) * (tl.to_ms - tl.from_ms)); }
+  svg.addEventListener("mousedown", function(ev){ startX = fx(ev); sel.setAttribute("visibility","visible"); ev.preventDefault(); });
+  svg.addEventListener("mousemove", function(ev){
+    if (startX === null) return;
+    var cur = fx(ev), a = Math.min(startX,cur), b = Math.max(startX,cur), W = svg.viewBox.baseVal.width;
+    sel.setAttribute("x", String(a*W)); sel.setAttribute("width", String((b-a)*W));
+  });
+  window.addEventListener("mouseup", function(ev){
+    if (startX === null) return;
+    var cur = fx(ev), a = Math.min(startX,cur), b = Math.max(startX,cur); startX = null;
+    sel.setAttribute("visibility","hidden");
+    if (b - a < 0.02) return; // a click, not a drag
+    state.absFrom = toMs(a); state.absTo = toMs(b); state.eventsOffset = 0;
+    load();
+  });
 }
 function mkPath(d, fill, stroke){
   var p = document.createElementNS("http://www.w3.org/2000/svg","path");
@@ -214,6 +254,11 @@ function mkLine(pts, x, y, val, color){
 function render(m, tl){
   document.getElementById("window").textContent = fmtTime(m.window.from_ms) + "  to  " + fmtTime(m.window.to_ms)
     + "  (" + m.coverage.covered_hours + "h covered" + (m.coverage.incomplete ? ", partial" : "") + ")";
+  var zn = document.getElementById("zoomnote"); zn.innerHTML = "";
+  if (state.absFrom && state.absTo){
+    zn.appendChild(document.createTextNode(" - zoomed  "));
+    var rb = el("button",{text:"reset zoom",style:"padding:2px 8px"}); rb.onclick = clearZoom; zn.appendChild(rb);
+  }
 
   var d = m.decisions, c = m.clipboard, ag = m.agents, res = m.resources || {};
   var toolCount = Object.keys(m.ai_usage.apps).length + Object.keys(m.ai_usage.sites).length;
@@ -373,19 +418,69 @@ function classTable(byClass){
   return el("table",{},[el("thead",{},[el("tr",{},[el("th",{text:"class"}),el("th",{class:"num",text:"decisions"}),el("th",{text:""})])]), el("tbody",{},rows)]);
 }
 
+function windowQS(){
+  if (state.absFrom && state.absTo) return "?from=" + state.absFrom + "&to=" + state.absTo;
+  return "?from=" + encodeURIComponent(state.from);
+}
 function load(){
-  var qs = "?from=" + encodeURIComponent(state.from);
+  var qs = windowQS();
   Promise.all([
     fetch("/api/metrics"+qs).then(function(r){ if(!r.ok) throw new Error("metrics "+r.status); return r.json(); }),
     fetch("/api/timeline"+qs).then(function(r){ if(!r.ok) throw new Error("timeline "+r.status); return r.json(); })
-  ]).then(function(res){ render(res[0], res[1]); })
+  ]).then(function(res){ render(res[0], res[1]); loadEvents(); })
     .catch(function(e){ document.getElementById("foot").textContent = "Error: " + e.message; });
 }
 function setRange(v){
-  state.from = v;
+  state.from = v; state.absFrom = null; state.absTo = null; state.eventsOffset = 0;
   var rg = document.getElementById("ranges").children;
   for (var i=0;i<rg.length;i++){ rg[i].classList.toggle("on", rg[i].dataset.v===v); }
   load();
+}
+function clearZoom(){ state.absFrom = null; state.absTo = null; state.eventsOffset = 0; load(); }
+
+// loadEvents fetches and renders the timestamped event list for the window.
+function loadEvents(){
+  var qs = windowQS() + "&limit=100&offset=" + state.eventsOffset + (state.eventsKind ? "&kind=" + encodeURIComponent(state.eventsKind) : "");
+  fetch("/api/events"+qs).then(function(r){ return r.json(); }).then(renderEvents)
+    .catch(function(e){ document.getElementById("eventscard").textContent = "Events error: " + e.message; });
+}
+function renderEvents(page){
+  var card = document.getElementById("eventscard"); card.innerHTML = "";
+  card.appendChild(el("h2",{text:"Events  (" + num(page.total) + " in window)"}));
+  var kinds = ["", "decision", "token_usage", "clipboard", "clipboard_guarded", "intake",
+    "ai_app_started", "ai_app_stopped", "ai_site_opened", "ai_site_closed", "resource_sample",
+    "agent_session_started", "agent_turn_started", "agent_turn_completed", "agent_tool_activity",
+    "agent_question_requested", "agent_approval_requested", "agent_error", "policy_reload"];
+  var sel = el("select",{style:"font:inherit;padding:4px 8px;border-radius:7px;border:1px solid var(--line);background:var(--bg);color:var(--ink);margin-bottom:10px"});
+  kinds.forEach(function(k){ var o = el("option",{value:k,text:k||"all kinds"}); if (k===state.eventsKind) o.selected=true; sel.appendChild(o); });
+  sel.onchange = function(){ state.eventsKind = sel.value; state.eventsOffset = 0; loadEvents(); };
+  card.appendChild(sel);
+  if (!page.events.length){ card.appendChild(el("div",{class:"empty",text:"No events."})); return; }
+  var rows = page.events.map(function(e){
+    return el("tr",{},[
+      el("td",{style:"white-space:nowrap;color:var(--muted)",text:fmtTime(e.t_ms)}),
+      el("td",{style:"white-space:nowrap",text:e.kind}),
+      el("td",{class:"name",title:e.detail,text:e.detail})
+    ]);
+  });
+  card.appendChild(el("table",{},[
+    el("thead",{},[el("tr",{},[el("th",{text:"time"}),el("th",{text:"kind"}),el("th",{text:"detail"})])]),
+    el("tbody",{}, rows)
+  ]));
+  var shown = state.eventsOffset + page.events.length;
+  var bar = el("div",{style:"margin-top:10px;display:flex;gap:8px;align-items:center"});
+  bar.appendChild(el("span",{class:"muted",text:"showing "+(state.eventsOffset+1)+"-"+shown+" of "+page.total}));
+  if (shown < page.total){
+    var more = el("button",{text:"Load more"});
+    more.onclick = function(){ state.eventsOffset += 100; loadEvents(); };
+    bar.appendChild(more);
+  }
+  if (state.eventsOffset > 0){
+    var top = el("button",{text:"Back to newest"});
+    top.onclick = function(){ state.eventsOffset = 0; loadEvents(); };
+    bar.appendChild(top);
+  }
+  card.appendChild(bar);
 }
 function setAuto(on){
   state.auto = on;

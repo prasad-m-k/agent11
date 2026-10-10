@@ -190,9 +190,10 @@ Query also takes `--agent-kind`, `--model`, and `--stall-ms`.
 | `GET /` | A self-contained HTML page (inline CSS and vanilla JS, no external resources; its own Content-Security-Policy forbids them) |
 | `GET /api/metrics?from=&to=&agent=&agent_kind=&model=&category=` | The full `metricsReport` as JSON |
 | `GET /api/timeline?from=&to=&buckets=` | Per-bucket counts of events, decisions, blocked, sensitive copies, and agent turns |
+| `GET /api/events?from=&to=&kind=&limit=&offset=` | Stored events, newest first, each with a timestamp and a content-free detail line; paginated |
 | `GET /healthz` | 200 |
 
-`from` and `to` take epoch ms, RFC 3339, or a duration back from now (`24h`, `7d`); the default window is 24 hours. The page shows summary tiles, an activity-over-time chart, an inventory of agents and AI tools on the machine (running-now status, active time, peak CPU and memory, process count), agent activity (time in state, turns, operator waits, stalls, sessions by model and kind), data-protection decisions (by verdict, class, and rule), clipboard and intake, destinations and models, and agent11's own overhead. It shows counts, labels, and timings only, because the store holds no content.
+`from` and `to` take epoch ms, RFC 3339, or a duration back from now (`24h`, `7d`); the default window is 24 hours. The page shows summary tiles, an activity-over-time chart, an inventory of agents and AI tools on the machine (running-now status, active time, peak CPU and memory, process count), agent activity (time in state, turns, operator waits, stalls, sessions by model and kind), data-protection decisions (by verdict, class, and rule), clipboard and intake, destinations and models, and agent11's own overhead. The activity chart legends toggle individual series, and dragging across the chart zooms the window to a time span (absolute `from`/`to`). A timestamped Events table lists the raw rows for the window, filterable by kind and paginated, so an aggregate can be drilled into. It shows counts, labels, and timings only, because the store holds no content.
 
 ### Hook socket
 
@@ -233,7 +234,7 @@ Each runs under a 3 second timeout so a hung tool cannot stall the loop.
 | `-guard-rules` | all built-in rules but `email`, plus `keyword:*` | Findings that trigger the guard |
 | `-interval`, `-ai-interval`, `-browser` | 500ms, 5s, true | Watcher cadence |
 | `-metrics`, `-metrics-db` | true, `<user config dir>/agent11/metrics.sqlite3` | Metrics store on or off, and its path |
-| `-metrics-retention`, `-metrics-max-mb` | 336h, 256 | Retention window and size cap |
+| `-metrics-retention`, `-metrics-max-mb` | 720h (30 days), 256 | Retention window and size cap |
 | `-hooks`, `-hook-socket` | true, `<user config dir>/agent11/hooks.sock` | Accept lifecycle events from `agent11 hook` |
 | `-dashboard` | `127.0.0.1:9090` | Serve the dashboard in-process (empty = off; needs `-metrics`) |
 | `-quiet`, `-once` | false | Console output; print clipboard and exit |
@@ -247,7 +248,7 @@ agent11 keeps two local stores: the rotating log and a SQLite metrics database. 
 | Rotating log `agent11.log` | Local file, mode 0600 | Rotates at 10 MB or 10,000 lines; keeps `.1` to `.5`, then deletes | Clipboard and intake text **yes, while `-log-content=true` (the default)**. Proxy decisions, process and tab events: no |
 | Policy | `policy.json` on disk, read only; compiled copy in memory | Reloaded when its mtime changes, checked every 5 s | Class definitions and short examples; must hold no real secrets |
 | Request body | Process memory | One request; dropped after forwarding | Yes, briefly; never written to disk or log |
-| Metrics database `metrics.sqlite3` (+ `-wal`, `-shm`) | `<user config dir>/agent11/`, file 0600, dir 0700 | 14 days (`-metrics-retention`), pruned hourly in batches; capped at 256 MB (`-metrics-max-mb`) | No: kinds, labels, counts, timings only |
+| Metrics database `metrics.sqlite3` (+ `-wal`, `-shm`) | `<user config dir>/agent11/`, file 0600, dir 0700 | 30 days (`-metrics-retention`), pruned hourly in batches, then incremental-vacuumed; hard-capped at 256 MB (`-metrics-max-mb`), beyond which new events are dropped and counted | No: kinds, labels, counts, timings only |
 | Last clipboard value | Process memory | Until the next change | Yes |
 | Guarded clipboard text | Nowhere: replaced by a notice; the log gets rule names and byte count only, even with `-log-content=true` | None | No |
 | Running-app and open-site sets | Process memory | Until the next scan | App names and site hosts |

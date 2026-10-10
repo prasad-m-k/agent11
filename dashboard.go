@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -173,6 +174,33 @@ func (s *dashboardServer) handler() http.Handler {
 		}
 		writeJSON(w, rep)
 	})
+	mux.HandleFunc("/api/events", func(w http.ResponseWriter, r *http.Request) {
+		f, err := s.filters(r, time.Now())
+		if err != nil {
+			httpError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		limit, offset := 100, 0
+		if n := r.URL.Query().Get("limit"); n != "" {
+			fmt.Sscanf(n, "%d", &limit)
+		}
+		if limit < 1 || limit > 500 {
+			limit = 100
+		}
+		if n := r.URL.Query().Get("offset"); n != "" {
+			fmt.Sscanf(n, "%d", &offset)
+		}
+		if offset < 0 {
+			offset = 0
+		}
+		page, err := queryEvents(s.db, f, r.URL.Query().Get("kind"), limit, offset)
+		if err != nil {
+			s.logger.Error("dashboard events query failed", "err", err)
+			httpError(w, http.StatusInternalServerError, "query failed")
+			return
+		}
+		writeJSON(w, page)
+	})
 	mux.HandleFunc("/api/timeline", func(w http.ResponseWriter, r *http.Request) {
 		f, err := s.filters(r, time.Now())
 		if err != nil {
@@ -266,4 +294,114 @@ func runDashboardCLI(args []string, stderr *os.File) int {
 		return 1
 	}
 	return 0
+}
+
+// eventRow is one stored event for the dashboard's timestamped list. It carries
+// a precomputed, content-free detail string so the page stays small.
+type eventRow struct {
+	Seq    int64  `json:"seq"`
+	TMs    int64  `json:"t_ms"`
+	Kind   string `json:"kind"`
+	Detail string `json:"detail"`
+}
+
+type eventsPage struct {
+	Events []eventRow `json:"events"`
+	Total  int        `json:"total"`
+	Limit  int        `json:"limit"`
+	Offset int        `json:"offset"`
+}
+
+// queryEvents returns stored events in a window, newest first, paginated. An
+// optional kind narrows the list. It reads the same body-free rows the store
+// holds and never exposes content.
+func queryEvents(db *sql.DB, f metricsFilters, kind string, limit, offset int) (*eventsPage, error) {
+	where := []string{"at_ms >= ?", "at_ms < ?"}
+	args := []any{f.FromMs, f.ToMs}
+	if kind != "" {
+		where, args = append(where, "kind = ?"), append(args, kind)
+	}
+	clause := strings.Join(where, " AND ")
+	p := &eventsPage{Events: []eventRow{}, Limit: limit, Offset: offset}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM events WHERE `+clause, args...).Scan(&p.Total); err != nil {
+		return nil, err
+	}
+	rows, err := db.Query(`SELECT seq, at_ms, kind, COALESCE(verdict,''), COALESCE(applied,''), COALESCE(enforced,0),
+		COALESCE(dest,''), COALESCE(app,''), COALESCE(model,''), COALESCE(agent_kind,''), COALESCE(agent_id,''),
+		COALESCE(tool_class,''), COALESCE(bytes,0), COALESCE(input_tokens,0), COALESCE(output_tokens,0),
+		COALESCE(cpu_max,0), COALESCE(rss_kb,0),
+		COALESCE((SELECT group_concat(l.label_kind || ':' || l.value) FROM event_labels l WHERE l.seq = events.seq), '')
+		FROM events WHERE `+clause+` ORDER BY seq DESC LIMIT ? OFFSET ?`, append(args, limit, offset)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var r eventRow
+		var verdict, applied, dest, app, model, agentKind, agentID, toolClass, labels string
+		var enforced, bytes, inTok, outTok, rssKB int64
+		var cpuMax float64
+		if err := rows.Scan(&r.Seq, &r.TMs, &r.Kind, &verdict, &applied, &enforced, &dest, &app, &model,
+			&agentKind, &agentID, &toolClass, &bytes, &inTok, &outTok, &cpuMax, &rssKB, &labels); err != nil {
+			return nil, err
+		}
+		r.Detail = eventDetail(r.Kind, detailFields{verdict, applied, enforced == 1, dest, app, model,
+			agentKind, agentID, toolClass, bytes, inTok, outTok, cpuMax, rssKB, labels})
+		p.Events = append(p.Events, r)
+	}
+	return p, rows.Err()
+}
+
+type detailFields struct {
+	verdict, applied     string
+	enforced             bool
+	dest, app, model     string
+	agentKind, agentID   string
+	toolClass            string
+	bytes, inTok, outTok int64
+	cpuMax               float64
+	rssKB                int64
+	labels               string
+}
+
+// eventDetail builds the one-line, content-free summary shown per event.
+func eventDetail(kind string, d detailFields) string {
+	join := func(parts ...string) string {
+		var out []string
+		for _, p := range parts {
+			if p != "" {
+				out = append(out, p)
+			}
+		}
+		return strings.Join(out, "  ")
+	}
+	var labs []string
+	for _, l := range strings.Split(d.labels, ",") {
+		if v := strings.TrimPrefix(l, "rule:"); v != l {
+			labs = append(labs, v)
+		} else if v := strings.TrimPrefix(l, "class:"); v != l {
+			labs = append(labs, "["+v+"]")
+		}
+	}
+	labels := strings.Join(labs, " ")
+	switch kind {
+	case kindDecision:
+		v := d.verdict
+		if d.enforced {
+			v += " (enforced)"
+		} else if d.verdict != "allow" {
+			v += " (report)"
+		}
+		return join(v, d.dest, d.model, labels)
+	case kindTokenUsage:
+		return join(d.model, d.dest, fmt.Sprintf("%d in / %d out tokens", d.inTok, d.outTok))
+	case kindClipboard, kindClipboardGuard, kindIntake:
+		return join(fmt.Sprintf("%d bytes", d.bytes), labels)
+	case kindResource:
+		return join(d.app, fmt.Sprintf("%.0f%% cpu peak", d.cpuMax), fmt.Sprintf("%d MB", d.rssKB/1024))
+	case kindAIAppStarted, kindAIAppStopped, kindAISiteOpened, kindAISiteClosed:
+		return d.app
+	default:
+		return join(d.agentKind, d.toolClass, d.dest, d.app)
+	}
 }
