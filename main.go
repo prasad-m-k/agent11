@@ -74,12 +74,57 @@ func main() {
 	keywords := flag.String("dlp-keywords", "", "comma-separated confidential markers to flag (e.g. a project codename)")
 	listen := flag.String("listen", "", "loopback address for the DLP scan endpoint, e.g. 127.0.0.1:8787 (empty = disabled)")
 	intakeToken := flag.String("intake-token", "", "bearer token required by the scan endpoint (generated if empty)")
+	policyPath := flag.String("policy", "", "company data policy file, JSON (required by -proxy and -eval)")
+	proxyAddr := flag.String("proxy", "", "loopback address for the LLM reverse proxy, e.g. 127.0.0.1:8788 (empty = disabled)")
+	proxyMaxMB := flag.Float64("proxy-max-mb", 32, "largest request body the proxy will scan and forward, in MB")
+	mode := flag.String("mode", "", "report or enforce; overrides the policy's global mode (per-class modes still win)")
+	evalDir := flag.String("eval", "", "score the policy against a labeled corpus directory, print the results, and exit")
+	classifierName := flag.String("classifier", "none", "classifier for ambiguous text: none or jev (jev reads OPENROUTER_API_KEY)")
+	classifierModel := flag.String("classifier-model", jevDefaultModel, "pinned classifier model ID")
+	classifierTimeout := flag.Duration("classifier-timeout", 2*time.Second, "longest the classifier may hold up a request")
 	flag.Parse()
 
 	scanner := newDLPScanner(strings.Split(*keywords, ","))
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	if *mode != "" && *mode != modeReport && *mode != modeEnforce {
+		fmt.Fprintf(os.Stderr, "error: -mode %q is not report or enforce\n", *mode)
+		os.Exit(2)
+	}
+	if (*proxyAddr != "" || *evalDir != "") && *policyPath == "" {
+		fmt.Fprintln(os.Stderr, "error: -proxy and -eval need -policy")
+		os.Exit(2)
+	}
+	var dec *decider
+	if *policyPath != "" {
+		// An invalid policy at startup is fatal; only reloads fall back.
+		pol, err := loadPolicy(*policyPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		clf, err := newClassifier(*classifierName, *classifierModel)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(2)
+		}
+		dec = newDecider(pol, clf, *classifierTimeout, *mode)
+	}
+
+	if *evalDir != "" {
+		samples, err := loadCorpus(*evalDir)
+		if err == nil {
+			dec.exhaustive = true
+			err = runEval(ctx, dec, samples, os.Stdout)
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error: eval:", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	if *once {
 		data, err := readClipboard(ctx)
@@ -116,10 +161,20 @@ func main() {
 		logger.Error("clipboard unavailable", "err", err)
 		os.Exit(1)
 	}
-	logger.Info("agent11 started", "interval", *interval, "log", *logPath,
-		"max_mb", *maxMB, "max_lines", *maxLines, "max_backups", *maxBackups, "ai_interval", *aiInterval)
+	startAttrs := []any{"interval", *interval, "log", *logPath,
+		"max_mb", *maxMB, "max_lines", *maxLines, "max_backups", *maxBackups, "ai_interval", *aiInterval}
+	if dec != nil {
+		pol := dec.policy.Load()
+		startAttrs = append(startAttrs, "policy", *policyPath, "proxy", *proxyAddr, "proxy_max_mb", *proxyMaxMB,
+			"mode", dec.modeFor(pol, nil), "classifier", dec.classifier.Name(), "classifier_timeout", *classifierTimeout)
+		// Raw content to a hosted classifier is an explicit policy choice; make it visible.
+		if raw := pol.rawClassifierClasses(); len(raw) > 0 && *classifierName != "none" {
+			startAttrs = append(startAttrs, "classifier_raw", strings.Join(raw, ","))
+		}
+	}
+	logger.Info("agent11 started", startAttrs...)
 
-	intakeErrCh := make(chan error, 1)
+	intakeErrCh := make(chan error, 2)
 	if *listen != "" {
 		token := *intakeToken
 		if token == "" {
@@ -135,6 +190,27 @@ func main() {
 				stop() // a requested endpoint that cannot start ends the program
 			}
 		}()
+	}
+	if *proxyAddr != "" {
+		p := newLLMProxy(dec, logSink{logger}, logger, int64(*proxyMaxMB*1024*1024))
+		go func() {
+			if err := startProxy(ctx, *proxyAddr, p); err != nil {
+				logger.Error("proxy failed", "err", err)
+				intakeErrCh <- err
+				stop()
+			}
+		}()
+	}
+	var policyTick <-chan time.Time
+	var policyMod time.Time
+	var lastPolicyErr string
+	if dec != nil {
+		if fi, err := os.Stat(*policyPath); err == nil {
+			policyMod = fi.ModTime()
+		}
+		t := time.NewTicker(policyReloadInterval)
+		defer t.Stop()
+		policyTick = t.C
 	}
 	if len(last) > 0 {
 		logClipboard(logger, scanner, *logContent, last)
@@ -171,10 +247,31 @@ func main() {
 			logger.Info("agent11 stopped")
 			select {
 			case <-intakeErrCh:
-				os.Exit(1) // the intake endpoint failed to start
+				os.Exit(1) // the intake endpoint or proxy failed to start
 			default:
 			}
 			return
+		case <-policyTick:
+			fi, err := os.Stat(*policyPath)
+			if err == nil && fi.ModTime().Equal(policyMod) {
+				continue
+			}
+			var pol *Policy
+			if err == nil {
+				pol, err = loadPolicy(*policyPath)
+			}
+			if err != nil {
+				// Keep the last good policy; log each distinct problem once.
+				if err.Error() != lastPolicyErr {
+					logger.Error("policy reload failed, keeping last good policy", "err", err)
+					lastPolicyErr = err.Error()
+				}
+				continue
+			}
+			policyMod, lastPolicyErr = fi.ModTime(), ""
+			dec.policy.Store(pol)
+			logger.Info("policy reloaded", "policy", *policyPath, "classes", len(pol.Classes))
+			continue
 		case <-aiTick:
 			if err := ai.scan(ctx, false); err != nil {
 				if ctx.Err() == nil && err.Error() != lastAIErr {
@@ -215,6 +312,24 @@ func main() {
 			logClipboard(logger, scanner, *logContent, data)
 			last = data
 		}
+	}
+}
+
+// policyReloadInterval is how often the policy file is checked for changes.
+const policyReloadInterval = 5 * time.Second
+
+func newClassifier(name, model string) (Classifier, error) {
+	switch name {
+	case "none", "":
+		return noopClassifier{}, nil
+	case "jev":
+		key := os.Getenv("OPENROUTER_API_KEY")
+		if key == "" {
+			return nil, errors.New("-classifier jev needs OPENROUTER_API_KEY in the environment")
+		}
+		return newJevClassifier(model, key), nil
+	default:
+		return nil, fmt.Errorf("-classifier %q is not none or jev", name)
 	}
 }
 

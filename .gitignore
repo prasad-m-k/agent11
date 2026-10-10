@@ -1,2 +1,4 @@
 agent11
 *.log
+.DS_Store
+graphify-out/
